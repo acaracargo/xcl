@@ -5160,10 +5160,15 @@ void put_bits(inout uint4 r, uint off, uint w, uint v) {
 }
 uint fmt_encode(uint x, uint info, uint c) {
     uint ty = (info >> 3) & 7u; uint w = (info >> (8u + 6u * c)) & 63u; float f = asfloat(x);
-    float maxu = w >= 32u ? 4294967295.0f : (float)((1u << w) - 1u);
-    float maxs = w >= 32u ? 2147483647.0f : (float)((1u << (w - 1u)) - 1u);
-    if (ty == 0u) return (uint)round(saturate(f) * maxu);
-    if (ty == 1u) return (uint)(int)round((isnan(f) ? 0.0f : clamp(f, -1.0f, 1.0f)) * maxs);
+    uint maxu = w >= 32u ? 0xFFFFFFFFu : (1u << w) - 1u;
+    uint maxs = w >= 32u ? 0x7FFFFFFFu : (1u << (w - 1u)) - 1u;
+    // rounded once (norm_f32_mag): round(f * max) in f32 rounds twice
+    if (ty == 0u) return select(or(isnan(f), f <= 0.0f), 0u, select(f >= 1.0f, maxu, norm_f32_mag(f, maxu)));
+    if (ty == 1u) {
+        if (isnan(f)) return 0u;
+        uint m = abs(f) >= 1.0f ? maxs : norm_f32_mag(f, maxs);
+        return f < 0.0f ? (uint)(-(int)m) : m;
+    }
     if (ty == 2u) return (uint)f;
     if (ty == 3u) return (uint)(int)f;
     if (ty == 4u || ty == 5u || w == 32u) return x;
