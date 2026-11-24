@@ -854,6 +854,71 @@ fn f64_rounding_and_conversions(wave64: bool) {
     assert!(bad.is_empty(), "wave{lanes}:\n{}", bad.join("\n"));
 }
 
+/// v_frexp_mant / v_frexp_exp in f32 and f16, and v_ldexp_f16: the mantissa in [0.5, 1) with the
+/// input's sign and the exponent that goes with it; ±0 gives 0 / 0; ±inf and NaN keep the mantissa
+/// and give exponent 0. f16 denormals are included (an f32 denormal depends on the denormal mode
+/// and is left out). The v_ldexp_f16 results are all exact in binary16, or far enough below its
+/// smallest denormal to be 0 in any rounding mode; an overflow is left out (#111).
+#[test]
+fn gpu_frexp_and_ldexp_f32_f16() {
+    if !gpu_ready() {
+        return;
+    }
+    let f32s: [f32; 15] = [
+        1.0, 0.5, 3.0, -6.0, 1e30, 1e-30, f32::MAX, f32::MIN_POSITIVE, 0.75, -0.1, 0.0, -0.0, f32::INFINITY, f32::NEG_INFINITY,
+        f32::NAN,
+    ];
+    // (f16 x, exponent for v_ldexp_f16 in the low half of S1; the high half holds another value)
+    let f16s: [(u16, i16); 15] = [
+        (0x3C00, 3), (0x3800, -1), (0x4200, 5), (0xC600, 2), (0x7BFF, -16), (0x0400, -1), (0x0001, 24), (0x0200, 1),
+        (0x8000, 10), (0x7C00, -5), (0xFC00, 7), (0x7E00, 1), (0xAE66, 4), (0x3C00, -24), (0x3C00, -30),
+    ];
+    let one = |n: &str, d: u64, s: u64| ins(n, "ENC_VOP1", &[("VDST", d), ("SRC0", V + s)], None);
+    let code = program_of(&[
+        one("V_FREXP_MANT_F32", 10, 1),
+        one("V_FREXP_EXP_I32_F32", 11, 1),
+        one("V_FREXP_MANT_F16", 12, 2),
+        one("V_FREXP_EXP_I16_F16", 13, 2),
+        ins("V_LDEXP_F16", "ENC_VOP3", &[("VDST", 14), ("SRC0", V + 2), ("SRC1", V + 3)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = f32s[l % f32s.len()].to_bits();
+        let (h, e) = f16s[l % f16s.len()];
+        r[2] = 0xBEEF_0000 | h as u32;
+        r[3] = 0x7777_0000 | e as u16 as u32;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    // frexp of a finite non-zero value in f64: (mantissa in [0.5, 1) with the sign, exponent)
+    let frexp = |x: f64| {
+        let e = x.abs().log2().floor() as i32 + 1;
+        (x / (2.0f64).powi(e), e)
+    };
+    let same = |got: f64, want: f64| if want.is_nan() { got.is_nan() } else { got == want && got.is_sign_negative() == want.is_sign_negative() };
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(f32s.len()) {
+        let x = f32s[l] as f64;
+        let (m, e) = if x == 0.0 || !x.is_finite() { (x, 0) } else { frexp(x) };
+        if !same(f32::from_bits(v[10]) as f64, m) || v[11] as i32 != e {
+            bad.push(format!("frexp f32 {x:e}: mant {:e}, exp {}; want {m:e}, {e}", f32::from_bits(v[10]), v[11] as i32));
+        }
+        let (hb, n) = f16s[l];
+        let h = f16_to_f64(hb);
+        let (m, e) = if h == 0.0 || !h.is_finite() { (h, 0) } else { frexp(h) };
+        let (gm, ge) = (f16_to_f64(v[12] as u16), v[13] as u16 as i16 as i32);
+        if !same(gm, m) || ge != e {
+            bad.push(format!("frexp f16 {h:e} ({hb:#06x}): mant {gm:e}, exp {ge}; want {m:e}, {e}"));
+        }
+        let want = h * (2.0f64).powi(n as i32);
+        let want = if want != 0.0 && want.abs() < (2.0f64).powi(-26) { 0.0f64.copysign(want) } else { want };
+        let got = f16_to_f64(v[14] as u16);
+        if !same(got, want) {
+            bad.push(format!("v_ldexp_f16({h:e}, {n}) = {got:e} ({:#06x}), want {want:e}", v[14] & 0xFFFF));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 /// v_sqrt_f64 and v_rsq_f64 over the whole f64 range. Denormals and values outside the f32
 /// range get real roots within an ulp of the CPU's, a negative x gives NaN and −0 gives −0.
 #[test]
