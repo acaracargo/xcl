@@ -6838,6 +6838,43 @@ fn gpu_ldexp_f32() {
     }
 }
 
+/// v_ldexp_f16 with results exact in binary16 (normals, denormals both ways, signed zeros, inf,
+/// NaN), with exponents past the f32 range for 0 and inf (x * exp2(n) would be 0 * inf), and one
+/// far enough below the smallest denormal to be 0 in any rounding mode. S1 is i16: its high half
+/// holds another value. An overflow is left out: default-mode f16 rounding gives 65504 (#111).
+#[test]
+fn gpu_ldexp_f16() {
+    if !gpu_ready() {
+        return;
+    }
+    let cases: [(u16, i16); 16] = [
+        (0x3C00, 3), (0x3800, -1), (0x4200, 5), (0xC600, 2), (0x7BFF, -16), (0x0400, -1), (0x0001, 24), (0x0200, 1),
+        (0x8000, 10), (0x7C00, -5), (0xFC00, 7), (0x7E00, 1), (0x3C00, -24), (0x3C00, -30),
+        (0x0000, 200), (0x7C00, -200),
+    ];
+    let code = program_of(&[ins("V_LDEXP_F16", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 2), ("SRC1", V + 3)], None)]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        let (h, e) = cases[l % cases.len()];
+        r[2] = 0xBEEF_0000 | h as u32;
+        r[3] = 0x7777_0000 | e as u16 as u32;
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(cases.len()) {
+        let (hb, n) = cases[l];
+        let h = f16_to_f64(hb);
+        let want = h * (2.0f64).powi(n as i32);
+        let want = if want != 0.0 && want.abs() < (2.0f64).powi(-26) { 0.0f64.copysign(want) } else { want };
+        let got = f16_to_f64(v[10] as u16);
+        let same = if want.is_nan() { got.is_nan() } else { got == want && got.is_sign_negative() == want.is_sign_negative() };
+        if !same {
+            bad.push(format!("v_ldexp_f16({h:e}, {n}) = {got:e} ({:#06x}), want {want:e}", v[10] & 0xFFFF));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 #[test]
 fn gpu_f64_literal_high_word() {
     for wave64 in gpu_waves() {
