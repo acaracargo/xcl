@@ -1000,6 +1000,89 @@ fn gpu_valu_float_and_int() {
     }
 }
 
+/// 16-bit and 24-bit integer VALU instructions no other GPU test runs, as VOP3 with v1 / v2 / v3
+/// as S0 / S1 / S2, compared per lane with the ISA's pseudo-code. Every lane has its own edge
+/// values (sign and carry boundaries, shift counts past 15, saturation), and the bits an
+/// instruction does not read hold other values (the high half for 16-bit sources, the top byte
+/// for 24-bit ones). For a 16-bit result only D[15:0] is compared.
+#[test]
+fn gpu_valu_16_and_24_bit_integer() {
+    if !gpu_ready() {
+        return;
+    }
+    let h = |x: u32| x & 0xFFFF;
+    let hs = |x: u32| x as u16 as i16 as i32;
+    let i24 = |x: u32| ((x << 8) as i32) >> 8;
+    let u24 = |x: u32| x & 0xFF_FFFF;
+    let sat16 = |x: u32| (x as i32).clamp(-32768, 32767) as u32 & 0xFFFF;
+    let bytes_sad = |a: u32, b: u32, n: u32| (0..n).map(|i| ((a >> (8 * i)) & 0xFF).abs_diff((b >> (8 * i)) & 0xFF)).sum::<u32>();
+    const M16: u32 = 0xFFFF;
+    const M32: u32 = u32::MAX;
+    // (instruction, mask of the compared result bits, reference)
+    let ops: &[(&str, u32, &dyn Fn(u32, u32, u32) -> u32)] = &[
+        ("V_ADD_NC_U16", M16, &|a, b, _| h(a).wrapping_add(h(b))),
+        ("V_SUB_NC_U16", M16, &|a, b, _| h(a).wrapping_sub(h(b))),
+        ("V_ADD_NC_I16", M16, &|a, b, _| (hs(a) + hs(b)) as u32),
+        ("V_SUB_NC_I16", M16, &|a, b, _| (hs(a) - hs(b)) as u32),
+        ("V_MUL_LO_U16", M16, &|a, b, _| h(a).wrapping_mul(h(b))),
+        ("V_LSHLREV_B16", M16, &|a, b, _| h(b) << (a & 15)),
+        ("V_LSHRREV_B16", M16, &|a, b, _| h(b) >> (a & 15)),
+        ("V_ASHRREV_I16", M16, &|a, b, _| (hs(b) >> (a & 15)) as u32),
+        ("V_MAX_U16", M16, &|a, b, _| h(a).max(h(b))),
+        ("V_MIN_U16", M16, &|a, b, _| h(a).min(h(b))),
+        ("V_MAX_I16", M16, &|a, b, _| hs(a).max(hs(b)) as u32),
+        ("V_MIN_I16", M16, &|a, b, _| hs(a).min(hs(b)) as u32),
+        ("V_MAD_U16", M16, &|a, b, c| h(a).wrapping_mul(h(b)).wrapping_add(h(c))),
+        ("V_MAD_I16", M16, &|a, b, c| (hs(a) * hs(b) + hs(c)) as u32),
+        ("V_MAD_U32_U16", M32, &|a, b, c| (h(a) * h(b)).wrapping_add(c)),
+        ("V_MAD_I32_I16", M32, &|a, b, c| ((hs(a) * hs(b)) as u32).wrapping_add(c)),
+        ("V_MUL_I32_I24", M32, &|a, b, _| i24(a).wrapping_mul(i24(b)) as u32),
+        ("V_MUL_HI_I32_I24", M32, &|a, b, _| ((i24(a) as i64 * i24(b) as i64) >> 32) as u32),
+        ("V_MUL_HI_U32_U24", M32, &|a, b, _| ((u24(a) as u64 * u24(b) as u64) >> 32) as u32),
+        ("V_MAD_I32_I24", M32, &|a, b, c| (i24(a).wrapping_mul(i24(b)) as u32).wrapping_add(c)),
+        ("V_SAD_HI_U8", M32, &|a, b, c| (bytes_sad(a, b, 4) << 16).wrapping_add(c)),
+        ("V_SAD_U16", M32, &|a, b, c| (h(a).abs_diff(h(b)) + (a >> 16).abs_diff(b >> 16)).wrapping_add(c)),
+        ("V_SAD_U32", M32, &|a, b, c| a.abs_diff(b).wrapping_add(c)),
+        ("V_CVT_PK_I16_I32", M32, &|a, b, _| sat16(a) | sat16(b) << 16),
+    ];
+    let inputs: [(u32, u32, u32); 12] = [
+        (0x1234_0001, 0xABCD_FFFF, 0x5555_0002),
+        (0xFFFF_7FFF, 0x0000_0001, 0x0000_8000),
+        (0x0001_8000, 0x7777_8000, 0xFFFF_FFFF),
+        (0xA5A5_0011, 0x0F0F_8001, 0x8000_0000), // shift count 17 → 1
+        (0x0000_000F, 0x1111_8421, 0x7FFF_FFFF),
+        (0xFF80_0000, 0x0080_0001, 0x0000_0003), // 24-bit: -2^23 × -(2^23 - 1)
+        (0x00FF_FFFF, 0x007F_FFFF, 0xFFFF_FF00),
+        (0x7FFF_FFFF, 0x8000_0000, 0x1234_5678), // i16 saturation both ways
+        (0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF),
+        (0x0102_0304, 0x0403_0201, 0x0000_0010),
+        (0, 0, 0),
+        (0x8000_7FFF, 0x0000_8000, 0x0000_0001),
+    ];
+    let code = program_of(
+        &ops.iter()
+            .enumerate()
+            .map(|(i, (n, ..))| ins(n, "ENC_VOP3", &[("VDST", 10 + i as u64), ("SRC0", V + 1), ("SRC1", V + 2), ("SRC2", V + 3)], None))
+            .collect::<Vec<_>>(),
+    );
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        (r[1], r[2], r[3]) = inputs[l % inputs.len()];
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(inputs.len()) {
+        let (a, b, c) = inputs[l];
+        for (i, (n, mask, reference)) in ops.iter().enumerate() {
+            let (got, want) = (v[10 + i] & mask, reference(a, b, c) & mask);
+            if got != want {
+                bad.push(format!("{n} a={a:#010x} b={b:#010x} c={c:#010x}: got {got:#x}, want {want:#x}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 /// Output modifiers each instruction kind applies: omod on f64 (clamp stays in double
 /// precision) and on the f64 → f32 / f32 → f16 conversions, and the integer clamp (saturation) of the
 /// unsigned adds, the packed 16-bit adds and the integer dot products.
