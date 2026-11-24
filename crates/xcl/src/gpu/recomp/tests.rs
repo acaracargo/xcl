@@ -6918,6 +6918,54 @@ fn gpu_pknorm_i16_f32_nan_and_fmt_encode_snorm_ufloat() {
     assert_eq!(r.mem[0x20C / 4], 0x8001_0000, "16_16_SNORM (NaN, -1.0)");
 }
 
+/// v_cvt_pknorm_u16_f32 / v_cvt_pknorm_i16_f32 round x * 65535 (32767) once to nearest even.
+/// Rounding the f32 product first and then the result is off by one for about 32 000 (16 000)
+/// f32 inputs; the inputs here are such cases across [0, 1) found by a CPU search (each one's exact
+/// product is just below or above a .5 that the f32 product lands on), plus the clamps, NaN and
+/// zeros. Both halves get the same input: low from S0, high from S1.
+#[test]
+fn gpu_pknorm_f32_rounds_once() {
+    if !gpu_ready() {
+        return;
+    }
+    let u16_cases = [
+        0x37c0_00c0u32, 0x3860_00e0, 0x38f0_00f0, 0x3978_00f8, 0x39fc_00fc, 0x3a7e_00fe, 0x3aff_00ff, 0x3c00_6080,
+        0x3c80_7080, 0x3d00_7880, 0x3d80_7c80, 0x3e00_7e80, 0x3e80_7f80, 0x3f00_8000,
+    ];
+    let i16_cases = [
+        0x3840_0180u32, 0x38e0_01c0, 0x3970_01e0, 0x39f8_01f0, 0x3a7c_01f8, 0x3afe_01fc, 0x3b7f_01fe, 0x3bff_81ff,
+        0x3d00_3100, 0x3d80_3900, 0x3e00_3d00, 0x3e80_3f00, 0x3f00_4000,
+    ];
+    let edges = [0.0f32, -0.0, 1.0, -1.0, 2.0, -2.0, f32::NAN, f32::INFINITY, 0.5, 0.999_999_94, -0.5, f32::from_bits(1)];
+    let mut xs: Vec<f32> = u16_cases.iter().chain(&i16_cases).map(|&b| f32::from_bits(b)).collect();
+    xs.extend(i16_cases.iter().map(|&b| -f32::from_bits(b)));
+    xs.extend(edges);
+    assert!(xs.len() <= 64);
+    let code = prog(&[
+        ("V_CVT_PKNORM_U16_F32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 1), ("SRC1", V + 1)], None),
+        ("V_CVT_PKNORM_I16_F32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V + 1), ("SRC1", V + 1)], None),
+    ]);
+    let mut st = KernelState::default();
+    for (l, r) in st.vgpr.iter_mut().enumerate() {
+        r[1] = xs[l % xs.len()].to_bits();
+    }
+    let r = runner::run_code(&code, &st, &[]).unwrap();
+    let unorm = |x: f32| if x.is_nan() || x <= 0.0 { 0 } else if x >= 1.0 { 65535 } else { (x as f64 * 65535.0).round_ties_even() as u32 };
+    let snorm = |x: f32| if x.is_nan() { 0 } else { ((x.clamp(-1.0, 1.0) as f64 * 32767.0).round_ties_even() as i32 as u32) & 0xFFFF };
+    let mut bad = Vec::new();
+    for (l, v) in r.vgpr.iter().enumerate().take(xs.len()) {
+        let x = xs[l];
+        let (u, s) = (unorm(x), snorm(x));
+        if v[10] != (u | u << 16) {
+            bad.push(format!("v_cvt_pknorm_u16_f32({x:e} = {:#010x}) = {:#010x}, want {:#010x}", x.to_bits(), v[10], u | u << 16));
+        }
+        if v[11] != (s | s << 16) {
+            bad.push(format!("v_cvt_pknorm_i16_f32({x:e} = {:#010x}) = {:#010x}, want {:#010x}", x.to_bits(), v[11], s | s << 16));
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}
+
 #[test]
 fn gpu_signed_bfe_arithmetic_shift() {
     for wave64 in gpu_waves() {
