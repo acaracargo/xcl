@@ -864,14 +864,16 @@ fn gpu_frexp_and_ldexp_f32_f16() {
     if !gpu_ready() {
         return;
     }
-    let f32s: [f32; 15] = [
+    let f32s: [f32; 18] = [
         1.0, 0.5, 3.0, -6.0, 1e30, 1e-30, f32::MAX, f32::MIN_POSITIVE, 0.75, -0.1, 0.0, -0.0, f32::INFINITY, f32::NEG_INFINITY,
-        f32::NAN,
+        f32::NAN, 2.0, -1.5, 1e20,
     ];
     // (f16 x, exponent for v_ldexp_f16 in the low half of S1; the high half holds another value)
-    let f16s: [(u16, i16); 15] = [
+    let f16s: [(u16, i16); 18] = [
         (0x3C00, 3), (0x3800, -1), (0x4200, 5), (0xC600, 2), (0x7BFF, -16), (0x0400, -1), (0x0001, 24), (0x0200, 1),
         (0x8000, 10), (0x7C00, -5), (0xFC00, 7), (0x7E00, 1), (0xAE66, 4), (0x3C00, -24), (0x3C00, -30),
+        // exponents past the f32 range: 0 and inf keep their value (x * exp2(n) would be 0 * inf)
+        (0x0000, 200), (0x8000, 300), (0x7C00, -200),
     ];
     let one = |n: &str, d: u64, s: u64| ins(n, "ENC_VOP1", &[("VDST", d), ("SRC0", V + s)], None);
     let code = program_of(&[
