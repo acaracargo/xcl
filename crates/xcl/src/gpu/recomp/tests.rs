@@ -7614,3 +7614,29 @@ fn jumps_to_outer_loop_heads_are_structured() {
     println!("{structured} of 120 programs structured ({entered} jumps into a loop), {ran} run both ways");
     assert!(structured >= 100 && entered > 20, "{structured} structured, {entered} jumps into loops");
 }
+
+/// The sign of a zero square root: sqrt(-0) is -0 and sqrt(+0) is +0 (IEEE 754), in f32 and f16.
+/// A float comparison takes -0 and +0 as equal, so the bits are compared.
+#[test]
+fn gpu_sqrt_keeps_the_sign_of_zero() {
+    for wave64 in gpu_waves() {
+        let p = prog(&[
+            ("V_SQRT_F32", "ENC_VOP1", &[("VDST", 10), ("SRC0", V + 0)], None),
+            ("V_SQRT_F32", "ENC_VOP1", &[("VDST", 11), ("SRC0", V + 1)], None),
+            ("V_SQRT_F16", "ENC_VOP1", &[("VDST", 12), ("SRC0", V + 2)], None),
+            ("V_SQRT_F16", "ENC_VOP1", &[("VDST", 13), ("SRC0", V + 3)], None),
+        ]);
+        let mut st = KernelState::default();
+        for r in st.vgpr.iter_mut() {
+            (r[0], r[1], r[2], r[3]) = (0, 0x8000_0000, 0, 0x8000);
+        }
+        let (r, lanes) = run_wave(&p, &st, wave64);
+        for l in 0..lanes {
+            let v = &r.vgpr[l];
+            assert_eq!(v[10], 0x0000_0000, "wave{lanes} lane {l} v_sqrt_f32(+0)");
+            assert_eq!(v[11], 0x8000_0000, "wave{lanes} lane {l} v_sqrt_f32(-0)");
+            assert_eq!(v[12] & 0xFFFF, 0x0000, "wave{lanes} lane {l} v_sqrt_f16(+0)");
+            assert_eq!(v[13] & 0xFFFF, 0x8000, "wave{lanes} lane {l} v_sqrt_f16(-0)");
+        }
+    }
+}
